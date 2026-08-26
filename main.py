@@ -2,12 +2,12 @@ import psycopg2
 import sys
 import time
 import logging
+import argparse
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
-
 
 CONN_STR = ("postgresql://guest@crt.sh:5432/certwatch"
             "?sslmode=disable&application_name=certsearch")
@@ -43,7 +43,6 @@ ci AS (
                     AND x509_notAfter(cai.CERTIFICATE) >= now() AT TIME ZONE 'UTC'
                 )
             )
-        ORDER BY cai.CERTIFICATE_ID
         LIMIT %s OFFSET %s
     ) sub
     GROUP BY sub.CERTIFICATE
@@ -51,7 +50,6 @@ ci AS (
 SELECT array_to_string(ci.NAME_VALUES, chr(10)) NAME_VALUE
 FROM ci;
 """
-
 
 def _connect(timeout_sec):
     conn = psycopg2.connect(CONN_STR, connect_timeout=timeout_sec)
@@ -62,12 +60,12 @@ def _connect(timeout_sec):
 
 
 def query_domain(domain, include_subdomains=True, include_expired=False,
-                 page_size=10000, timeout_sec=15, max_retries=5):
+                 page_size=15000, timeout_sec=15, max_retries=5):
 
-    conn, cursor = _connect(timeout_sec)
     base_delay = 0.1
     results = set()
     offset = 0
+    conn = cursor = None
 
     try:
         while True:
@@ -78,22 +76,25 @@ def query_domain(domain, include_subdomains=True, include_expired=False,
             last_err = None
             for attempt in range(1, max_retries + 1):
                 try:
+                    if conn is None:
+                        conn, cursor = _connect(timeout_sec)
                     cursor.execute(QUERY_STR, params)
                     rows = cursor.fetchall()
                     break
                 except psycopg2.Error as e:
                     last_err = e
                     log.info(f"page offset={offset} attempt {attempt} failed: {e}")
+                    # descarta a conexao (possivelmente morta); o proximo attempt reconecta
+                    try:
+                        if conn is not None:
+                            conn.close()
+                    except Exception:
+                        pass
+                    conn = cursor = None
                     if attempt < max_retries:
                         time.sleep(base_delay * (2 ** (attempt - 1)))
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        conn, cursor = _connect(timeout_sec)
             else:
                 raise last_err
-
 
             if not rows:
                 break
@@ -107,46 +108,65 @@ def query_domain(domain, include_subdomains=True, include_expired=False,
 
             offset += page_size
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     return results
 
 
-def read_domains(argv):
-    if len(argv) > 1:
-        return [d.strip() for d in argv[1:] if d.strip()]
+def read_domains(args):
+    if args.domains:
+        return [d.strip() for d in args.domains if d.strip()]
     if not sys.stdin.isatty():
         return [line.strip() for line in sys.stdin if line.strip()]
     return []
 
 
-MAX_WORKERS = 5 
+def args_parse():
+    parser = argparse.ArgumentParser(
+        prog="certsearch",
+        description="Extract subdomains from CT Logs via crt.sh PostgresSQL database")
+    parser.add_argument("domains", nargs="*",
+                        help="domain(s) to search (or pipe one per line via stdin)")
+    parser.add_argument("--include-expired", action="store_true", default=False,
+                        help="include expired certificates (default: only valid ones)")
+    parser.add_argument("--no-subdomains", dest="include_subdomains",
+                        action="store_false", default=True,
+                        help="match only the exact domain, not its subdomains")
+    parser.add_argument("--workers", type=int, default=5,
+                        help="max concurrent connections to crt.sh (default: 5)")
+    parser.add_argument("--output", help="output file (default: stdout)", default=None)
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    domains = read_domains(sys.argv)
+    args = args_parse()
+    domains = read_domains(args)
     if not domains:
-        print("use: certsearch <domain1> <domain2> ...")
-        print("     cat dominios.txt | certsearch")
+        print("use -h for help", file=sys.stderr)
         sys.exit(1)
 
     seen = set()
     print_lock = threading.Lock()
+    out = open(args.output, "w") if args.output else sys.stdout
 
     def worker(domain):
         try:
-            names = query_domain(domain)
+            names = query_domain(domain,
+                                 include_subdomains=args.include_subdomains,
+                                 include_expired=args.include_expired)
         except psycopg2.Error as e:
             log.info(f"error querying {domain}: {e}")
             return
-        
+
         with print_lock:
             for n in sorted(names):
                 if n not in seen:
                     seen.add(n)
-                    print(n, flush=True)
+                    out.write(n + "\n")
+                    out.flush()
 
-    workers = min(MAX_WORKERS, len(domains))
+    workers = min(args.workers, len(domains))
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(worker, d) for d in domains]
@@ -154,3 +174,6 @@ if __name__ == "__main__":
                 f.result()
     except KeyboardInterrupt:
         sys.exit(1)
+    finally:
+        if args.output:
+            out.close()
